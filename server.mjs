@@ -83,7 +83,6 @@ async function userIdPorNombre(nombre) {
 
 async function enviarPush(tokens, { title, body, data = {} }) {
   const list = [...new Set((tokens || []).filter(Boolean))];
-  console.log(`enviarPush "${title}" -> ${list.length} token(s)`);
   if (!list.length) return { enviados: 0 };
   const dataStr = Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v ?? "")]));
   let enviados = 0;
