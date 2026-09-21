@@ -83,6 +83,7 @@ async function userIdPorNombre(nombre) {
 
 async function enviarPush(tokens, { title, body, data = {} }) {
   const list = [...new Set((tokens || []).filter(Boolean))];
+  console.log(`enviarPush "${title}" -> ${list.length} token(s)`);
   if (!list.length) return { enviados: 0 };
   const dataStr = Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v ?? "")]));
   let enviados = 0;
@@ -224,6 +225,7 @@ const routes = {
 
 const server = http.createServer(async (req, res) => {
   try {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
     if (req.method === "GET" && req.url === "/health") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
