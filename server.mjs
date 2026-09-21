@@ -1,6 +1,7 @@
 import http from "node:http";
 import { createClient } from "@supabase/supabase-js";
 import admin from "firebase-admin";
+import ws from "ws";
 
 const PORT = Number(process.env.PORT || 8790) || 8790;
 const HOST = String(process.env.HOST || "0.0.0.0");
@@ -32,7 +33,9 @@ try {
 }
 
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+  realtime: { transport: ws },
+});
 
 const norm = (v = "") =>
   String(v || "")

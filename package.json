@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.4",
-    "firebase-admin": "^12.6.0"
+    "firebase-admin": "^12.6.0",
+    "ws": "^8.18.0"
   }
 }
