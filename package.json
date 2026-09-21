@@ -1,0 +1,14 @@
+{
+  "name": "dim-notificaciones-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.4",
+    "firebase-admin": "^12.6.0"
+  }
+}
