@@ -188,6 +188,37 @@ async function onLiquidacionInsert(record = {}) {
   }
 }
 
+async function onChatOrdenMensaje(record = {}) {
+  const ordenId = record.orden_id;
+  const autor = record.autor || "";
+  const autorRol = norm(record.autor_rol || "");
+  const texto = record.texto || (record.foto_url ? "Foto" : "");
+  if (!ordenId || !autor) return;
+
+  const { data: orden, error } = await supabase
+    .from("ordenes")
+    .select("codigo,nombre,tecnico")
+    .eq("id", ordenId)
+    .maybeSingle();
+  if (error || !orden) return;
+
+  const titulo = `Mensaje en orden${orden.codigo ? ` ${orden.codigo}` : ""}`;
+  const cuerpo = `${autor}: ${texto}`;
+  const dataPayload = { tipo: "chat_orden", orden_id: String(ordenId) };
+
+  if (autorRol === norm("Tecnico")) {
+    // Tecnico escribio -> avisar a todos los admins activos.
+    const adminIds = await userIdsPorRol("Administrador");
+    const adminTokens = await tokensPorUserIds(adminIds);
+    await enviarPush(adminTokens, { title: titulo, body: cuerpo, data: dataPayload });
+  } else if (orden.tecnico && norm(orden.tecnico) !== norm(autor)) {
+    // Gestora/admin escribio -> avisar al tecnico asignado a esa orden.
+    const tecId = await userIdPorNombre(orden.tecnico);
+    const tecTokens = await tokensPorUserIds(tecId ? [tecId] : []);
+    await enviarPush(tecTokens, { title: titulo, body: cuerpo, data: dataPayload });
+  }
+}
+
 async function onMaterialAsignado(record = {}, oldRecord = null) {
   const tecnico = record.tecnico || "";
   const materialNombre = record.material_nombre || "";
@@ -219,6 +250,10 @@ const routes = {
   "/webhook/materiales": async (payload) => {
     if (payload.type !== "INSERT" && payload.type !== "UPDATE") return;
     await onMaterialAsignado(payload.record || {}, payload.type === "UPDATE" ? payload.old_record : null);
+  },
+  "/webhook/chat-ordenes": async (payload) => {
+    if (payload.type !== "INSERT") return;
+    await onChatOrdenMensaje(payload.record || {});
   },
 };
 
