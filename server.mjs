@@ -211,11 +211,23 @@ async function onChatOrdenMensaje(record = {}) {
     const adminIds = await userIdsPorRol("Administrador");
     const adminTokens = await tokensPorUserIds(adminIds);
     await enviarPush(adminTokens, { title: titulo, body: cuerpo, data: dataPayload });
-  } else if (orden.tecnico && norm(orden.tecnico) !== norm(autor)) {
-    // Gestora/admin escribio -> avisar al tecnico asignado a esa orden.
-    const tecId = await userIdPorNombre(orden.tecnico);
-    const tecTokens = await tokensPorUserIds(tecId ? [tecId] : []);
-    await enviarPush(tecTokens, { title: titulo, body: cuerpo, data: dataPayload });
+  } else {
+    // Gestora o admin escribio -> avisar al tecnico asignado a esa orden,
+    // y ademas a todos los admins (pedido explicito: si escribe una
+    // gestora, el admin tambien se entera). No se duplica aviso al propio
+    // autor si el que escribe es admin.
+    const destinatarioIds = new Set();
+    if (orden.tecnico && norm(orden.tecnico) !== norm(autor)) {
+      const tecId = await userIdPorNombre(orden.tecnico);
+      if (tecId) destinatarioIds.add(tecId);
+    }
+    const adminIds = await userIdsPorRol("Administrador");
+    const autorId = await userIdPorNombre(autor);
+    for (const id of adminIds) {
+      if (id !== autorId) destinatarioIds.add(id);
+    }
+    const tokens = await tokensPorUserIds([...destinatarioIds]);
+    await enviarPush(tokens, { title: titulo, body: cuerpo, data: dataPayload });
   }
 }
 
