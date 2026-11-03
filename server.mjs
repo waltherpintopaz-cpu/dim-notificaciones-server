@@ -273,6 +273,23 @@ async function onMaterialAsignado(record = {}, oldRecord = null) {
   });
 }
 
+async function onTareaInsert(record = {}) {
+  // Solo urgentes -- las normales no justifican interrumpir con push (se ven
+  // igual en "Mis tareas" de la app/panel). Pedido explicito 2026-11-03:
+  // "en la apk tambien quiero esto" (push cuando me asignan una urgente).
+  if (record.prioridad !== "alta") return;
+  const asignadoA = record.asignado_a || "";
+  if (!asignadoA) return;
+
+  const tecId = await userIdPorNombre(asignadoA);
+  const tokens = await tokensPorUserIds(tecId ? [tecId] : []);
+  await enviarPush(tokens, {
+    title: `🔴 Tarea urgente${record.cliente_nombre ? ` · ${record.cliente_nombre}` : ""}`,
+    body: `${record.asignado_por || "Alguien"}: ${record.descripcion || ""}`,
+    data: { tipo: "tarea_urgente", tarea_id: String(record.id || "") },
+  });
+}
+
 // ── Servidor HTTP ─────────────────────────────────────────────────────────
 
 const routes = {
@@ -295,6 +312,10 @@ const routes = {
   "/webhook/chat-tecnicos": async (payload) => {
     if (payload.type !== "INSERT") return;
     await onChatTecnicoMensaje(payload.record || {});
+  },
+  "/webhook/tareas": async (payload) => {
+    if (payload.type !== "INSERT") return;
+    await onTareaInsert(payload.record || {});
   },
 };
 
