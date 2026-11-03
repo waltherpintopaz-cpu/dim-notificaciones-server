@@ -231,6 +231,31 @@ async function onChatOrdenMensaje(record = {}) {
   }
 }
 
+async function onChatTecnicoMensaje(record = {}) {
+  const tecnicoNombre = record.tecnico_nombre || "";
+  const autor = record.autor || "";
+  const autorRol = norm(record.autor_rol || "");
+  const texto = record.texto || (record.foto_url ? "Foto" : "");
+  if (!tecnicoNombre || !autor) return;
+
+  const titulo = `Mensaje de ${autor}`;
+  const cuerpo = texto;
+  const dataPayload = { tipo: "chat_tecnico", tecnico_nombre: tecnicoNombre };
+
+  if (autorRol === norm("Tecnico")) {
+    // Tecnico escribio -> avisar a todas las gestoras + admins.
+    const gestoraIds = await userIdsPorRol("Gestora");
+    const adminIds = await userIdsPorRol("Administrador");
+    const tokens = await tokensPorUserIds([...gestoraIds, ...adminIds]);
+    await enviarPush(tokens, { title: titulo, body: cuerpo, data: dataPayload });
+  } else {
+    // Gestora o admin escribio -> avisar solo al tecnico del hilo.
+    const tecId = await userIdPorNombre(tecnicoNombre);
+    const tecTokens = await tokensPorUserIds(tecId ? [tecId] : []);
+    await enviarPush(tecTokens, { title: titulo, body: cuerpo, data: dataPayload });
+  }
+}
+
 async function onMaterialAsignado(record = {}, oldRecord = null) {
   const tecnico = record.tecnico || "";
   const materialNombre = record.material_nombre || "";
@@ -266,6 +291,10 @@ const routes = {
   "/webhook/chat-ordenes": async (payload) => {
     if (payload.type !== "INSERT") return;
     await onChatOrdenMensaje(payload.record || {});
+  },
+  "/webhook/chat-tecnicos": async (payload) => {
+    if (payload.type !== "INSERT") return;
+    await onChatTecnicoMensaje(payload.record || {});
   },
 };
 
