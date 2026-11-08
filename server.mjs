@@ -132,7 +132,7 @@ const empresaDe = (clave) => EMPRESAS[String(clave || "").toLowerCase()] ? Strin
 async function leerConfigAlertas(sb = supabase) {
   const { data, error } = await sb
     .from("alertas_whatsapp_config")
-    .select("activo,grupo_id,grupo_nombre,numeros")
+    .select("*")
     .eq("id", 1)
     .maybeSingle();
   if (error) {
@@ -142,11 +142,29 @@ async function leerConfigAlertas(sb = supabase) {
   return data || null;
 }
 
+// "Nod_01", "1", "nodo 1" -> "1"; si no tiene numero, el texto en minusculas.
+function claveNodo(v) {
+  const s = String(v ?? "").trim();
+  const m = s.match(/\d+/);
+  return m ? String(Number(m[0])) : s.toLowerCase();
+}
+
+// Nodos privados: si la orden es de un nodo con regla propia, la alerta va
+// SOLO a los numeros de esa regla (y al grupo solo si la regla lo pide).
+function reglaParaNodo(cfg, nodo) {
+  if (!nodo && nodo !== 0) return null;
+  const k = claveNodo(nodo);
+  if (!k) return null;
+  return (Array.isArray(cfg?.reglas_nodo) ? cfg.reglas_nodo : []).find((r) => r?.nodo && claveNodo(r.nodo) === k) || null;
+}
+
 // Numeros de 9 digitos (celular peruano) se completan con 51.
-function destinosAlertas(cfg) {
+function destinosAlertas(cfg, nodo = null) {
+  const regla = reglaParaNodo(cfg, nodo);
+  const base = regla ? { grupo_id: regla.con_grupo ? cfg?.grupo_id : null, numeros: regla.numeros } : cfg;
   const out = [];
-  if (cfg?.grupo_id) out.push(String(cfg.grupo_id).trim());
-  for (const n of Array.isArray(cfg?.numeros) ? cfg.numeros : []) {
+  if (base?.grupo_id) out.push(String(base.grupo_id).trim());
+  for (const n of Array.isArray(base?.numeros) ? base.numeros : []) {
     const d = String(n?.numero ?? n ?? "").replace(/\D/g, "");
     if (d.length === 9) out.push(`51${d}`);
     else if (d.length >= 10) out.push(d);
@@ -182,7 +200,7 @@ async function onChatUrgente(record = {}, orden = {}, empresa = "dim") {
   const emp = EMPRESAS[empresa] || EMPRESAS.dim;
   const cfg = await leerConfigAlertas(emp.sb);
   if (!cfg?.activo) return;
-  const destinos = destinosAlertas(cfg);
+  const destinos = destinosAlertas(cfg, orden.nodo);
   if (!destinos.length) return;
   // Freno del lado del servidor (la app ya limita a 1 cada 10 min por orden).
   const ahora = Date.now();
@@ -475,9 +493,11 @@ async function rutaAlertas(req, res) {
       if (Date.now() - (ultimaPrueba[empresa] || 0) < 30 * 1000) return responder(200, { ok: false, error: "Espera 30 segundos entre pruebas." });
       ultimaPrueba[empresa] = Date.now();
       const cfg = await leerConfigAlertas(EMPRESAS[empresa].sb);
-      const destinos = destinosAlertas(cfg);
+      const nodo = u.searchParams.get("nodo");
+      if (nodo && !reglaParaNodo(cfg, nodo)) return responder(200, { ok: false, error: "Ese nodo no tiene regla guardada." });
+      const destinos = destinosAlertas(cfg, nodo);
       if (!destinos.length) return responder(200, { ok: false, error: "No hay grupo ni números guardados." });
-      const r = await enviarWhatsapp(destinos, `✅ *Prueba de alertas ${EMPRESAS[empresa].nombre}*\n\nAsí llegarán los mensajes 🚨 URGENTE que manden los técnicos desde el chat de la orden.`);
+      const r = await enviarWhatsapp(destinos, `✅ *Prueba de alertas ${EMPRESAS[empresa].nombre}${nodo ? ` · nodo ${nodo}` : ""}*\n\nAsí llegarán los mensajes 🚨 URGENTE que manden los técnicos desde el chat de la orden.`);
       return responder(200, { ok: r.enviados > 0, enviados: r.enviados, total: destinos.length, errores: r.errores });
     }
     return responder(404, { ok: false, error: "not found" });
