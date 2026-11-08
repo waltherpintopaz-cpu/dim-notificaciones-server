@@ -81,10 +81,46 @@ async function userIdPorNombre(nombre) {
   return match ? match.id : null;
 }
 
-async function enviarPush(tokens, { title, body, data = {} }) {
+// ── Configuracion de notificaciones (web: Configuracion > Notificaciones) ──
+// Tabla notificaciones_config (fila id=1) en el Supabase de DIM. Se cachea
+// 30 s para no leerla en cada push. Iconos y sonidos deben existir en la APK
+// (res/drawable/notif_chat_*.xml y canales chat_*); si un celular tiene una
+// APK vieja sin ellos, Android usa el icono/canal por defecto (no se pierde).
+const ICONOS_CHAT = ["globo", "campana", "sobre"];
+const SONIDOS_CHAT = ["predeterminado", "burbuja", "doble", "campana"];
+const colorValido = (c) => (/^#[0-9a-fA-F]{6}$/.test(String(c || "")) ? String(c) : null);
+let cacheConfigNotif = { t: 0, v: null };
+async function leerConfigNotif() {
+  if (Date.now() - cacheConfigNotif.t < 30 * 1000) return cacheConfigNotif.v;
+  const { data, error } = await supabase.from("notificaciones_config").select("*").eq("id", 1).maybeSingle();
+  if (error) console.warn("Error leyendo notificaciones_config:", error.message);
+  cacheConfigNotif = { t: Date.now(), v: error ? null : data || null };
+  return cacheConfigNotif.v;
+}
+// Opciones para un aviso de CHAT; null = los avisos de chat estan apagados.
+async function opcionesChat() {
+  const cfg = (await leerConfigNotif()) || {};
+  if (cfg.chat_activo === false) return null;
+  const icono = ICONOS_CHAT.includes(cfg.chat_icono) ? cfg.chat_icono : "globo";
+  const sonido = SONIDOS_CHAT.includes(cfg.chat_sonido) ? cfg.chat_sonido : "burbuja";
+  const prefijo = cfg.chat_prefijo == null ? "💬" : String(cfg.chat_prefijo).trim();
+  return {
+    titulo: (t) => (prefijo ? `${prefijo} ${t}` : t),
+    android: { channelId: `chat_${sonido}`, icon: `notif_chat_${icono}`, color: colorValido(cfg.chat_color) || "#7C3AED" },
+  };
+}
+
+async function enviarPush(tokens, { title, body, data = {}, android = null }) {
   const list = [...new Set((tokens || []).filter(Boolean))];
   if (!list.length) return { enviados: 0 };
   const dataStr = Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v ?? "")]));
+  // Avisos normales: canal "default" con el color configurado; los de chat
+  // traen su propio canal/icono/color (opcionesChat).
+  let androidNotif = android;
+  if (!androidNotif) {
+    const color = colorValido((await leerConfigNotif())?.normal_color);
+    androidNotif = { channelId: "default", ...(color ? { color } : {}) };
+  }
   let enviados = 0;
   for (const token of list) {
     try {
@@ -92,7 +128,7 @@ async function enviarPush(tokens, { title, body, data = {} }) {
         token,
         notification: { title, body },
         data: dataStr,
-        android: { priority: "high", notification: { channelId: "default" } },
+        android: { priority: "high", notification: androidNotif },
       });
       enviados += 1;
     } catch (e) {
@@ -329,7 +365,9 @@ async function onChatOrdenMensaje(record = {}) {
     onChatUrgente(record, orden).catch((e) => console.error("Error alerta urgente:", e?.message));
   }
 
-  const titulo = `${record.urgente ? "🚨 URGENTE · " : ""}Mensaje en orden${orden.codigo ? ` ${orden.codigo}` : ""}`;
+  const opc = await opcionesChat();
+  if (!opc) return;
+  const titulo = opc.titulo(`${record.urgente ? "🚨 URGENTE · " : ""}Orden${orden.codigo ? ` ${orden.codigo}` : ""}`);
   const cuerpo = `${autor}: ${texto}`;
   const dataPayload = { tipo: "chat_orden", orden_id: String(ordenId) };
 
@@ -337,7 +375,7 @@ async function onChatOrdenMensaje(record = {}) {
     // Tecnico escribio -> avisar a todos los admins activos.
     const adminIds = await userIdsPorRol("Administrador");
     const adminTokens = await tokensPorUserIds(adminIds);
-    await enviarPush(adminTokens, { title: titulo, body: cuerpo, data: dataPayload });
+    await enviarPush(adminTokens, { title: titulo, body: cuerpo, data: dataPayload, android: opc.android });
   } else {
     // Gestora o admin escribio -> avisar al tecnico asignado a esa orden,
     // y ademas a todos los admins (pedido explicito: si escribe una
@@ -354,7 +392,7 @@ async function onChatOrdenMensaje(record = {}) {
       if (id !== autorId) destinatarioIds.add(id);
     }
     const tokens = await tokensPorUserIds([...destinatarioIds]);
-    await enviarPush(tokens, { title: titulo, body: cuerpo, data: dataPayload });
+    await enviarPush(tokens, { title: titulo, body: cuerpo, data: dataPayload, android: opc.android });
   }
 }
 
@@ -365,7 +403,9 @@ async function onChatTecnicoMensaje(record = {}) {
   const texto = record.texto || (record.foto_url ? "Foto" : "");
   if (!tecnicoNombre || !autor) return;
 
-  const titulo = `Mensaje de ${autor}`;
+  const opc = await opcionesChat();
+  if (!opc) return;
+  const titulo = opc.titulo(autor);
   const cuerpo = texto;
   const dataPayload = { tipo: "chat_tecnico", tecnico_nombre: tecnicoNombre };
 
@@ -374,12 +414,12 @@ async function onChatTecnicoMensaje(record = {}) {
     const gestoraIds = await userIdsPorRol("Gestora");
     const adminIds = await userIdsPorRol("Administrador");
     const tokens = await tokensPorUserIds([...gestoraIds, ...adminIds]);
-    await enviarPush(tokens, { title: titulo, body: cuerpo, data: dataPayload });
+    await enviarPush(tokens, { title: titulo, body: cuerpo, data: dataPayload, android: opc.android });
   } else {
     // Gestora o admin escribio -> avisar solo al tecnico del hilo.
     const tecId = await userIdPorNombre(tecnicoNombre);
     const tecTokens = await tokensPorUserIds(tecId ? [tecId] : []);
-    await enviarPush(tecTokens, { title: titulo, body: cuerpo, data: dataPayload });
+    await enviarPush(tecTokens, { title: titulo, body: cuerpo, data: dataPayload, android: opc.android });
   }
 }
 
@@ -506,12 +546,54 @@ async function rutaAlertas(req, res) {
   }
 }
 
+// Prueba desde la web (Configuracion > Notificaciones): manda un aviso de
+// chat de ejemplo, con la configuracion guardada, al usuario que la pide.
+// Solo DIM (Americanet manda sus avisos por su propia Edge Function).
+const ultimaPruebaNotif = {};
+async function rutaNotificaciones(req, res) {
+  const u = new URL(req.url, "http://local");
+  const responder = (status, obj) => {
+    res.writeHead(status, {
+      "content-type": "application/json",
+      "access-control-allow-origin": "*",
+      "access-control-allow-methods": "POST,OPTIONS",
+      "access-control-allow-headers": "content-type",
+    });
+    res.end(JSON.stringify(obj));
+  };
+  if (req.method === "OPTIONS") return responder(204, {});
+  try {
+    if (req.method === "POST" && u.pathname === "/notificaciones/prueba") {
+      const { usuario } = await readJsonBody(req);
+      const nombre = String(usuario || "").trim();
+      if (!nombre) return responder(200, { ok: false, error: "Falta el usuario." });
+      if (Date.now() - (ultimaPruebaNotif[norm(nombre)] || 0) < 20 * 1000) return responder(200, { ok: false, error: "Espera 20 segundos entre pruebas." });
+      ultimaPruebaNotif[norm(nombre)] = Date.now();
+      cacheConfigNotif = { t: 0, v: null }; // leer lo recien guardado
+      const opc = await opcionesChat();
+      if (!opc) return responder(200, { ok: false, error: "Los avisos de chat están apagados." });
+      const id = await userIdPorNombre(nombre);
+      const tokens = await tokensPorUserIds(id ? [id] : []);
+      if (!tokens.length) return responder(200, { ok: false, error: "Tu usuario no tiene un celular registrado. Inicia sesión en la app y vuelve a probar." });
+      const r = await enviarPush(tokens, { title: opc.titulo("Prueba de chat"), body: "Así se verán los mensajes del chat.", data: { tipo: "prueba" }, android: opc.android });
+      return responder(200, { ok: r.enviados > 0, enviados: r.enviados });
+    }
+    return responder(404, { ok: false, error: "not found" });
+  } catch (e) {
+    return responder(200, { ok: false, error: e?.message || "Error" });
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
     if (req.method === "GET" && req.url === "/health") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    if (String(req.url || "").startsWith("/notificaciones/")) {
+      await rutaNotificaciones(req, res);
       return;
     }
     if (String(req.url || "").startsWith("/alertas/")) {
