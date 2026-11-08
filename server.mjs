@@ -102,6 +102,96 @@ async function enviarPush(tokens, { title, body, data = {} }) {
   return { enviados };
 }
 
+// ── Alertas urgentes por WhatsApp (Evolution API) ────────────────────────
+// Solo los mensajes del chat de la orden marcados como URGENTE (boton 🚨 del
+// tecnico) mandan WhatsApp. A quien: grupo + numeros guardados en la tabla
+// alertas_whatsapp_config (id=1), que se edita desde la web (Configuracion
+// > Alertas WhatsApp). La API key de Evolution vive solo aqui (env), nunca
+// en la app ni en la web.
+const EVOLUTION_URL = String(process.env.EVOLUTION_URL || "https://api.americanet.space").trim().replace(/\/+$/, "");
+const EVOLUTION_INSTANCIA = String(process.env.EVOLUTION_INSTANCIA || "Notificaciones DIM").trim();
+const EVOLUTION_APIKEY = String(process.env.EVOLUTION_APIKEY || "").trim();
+
+function urlEvolution(ruta, query = "") {
+  return `${EVOLUTION_URL}${ruta}/${encodeURIComponent(EVOLUTION_INSTANCIA)}${query}`;
+}
+
+async function leerConfigAlertas() {
+  const { data, error } = await supabase
+    .from("alertas_whatsapp_config")
+    .select("activo,grupo_id,grupo_nombre,numeros")
+    .eq("id", 1)
+    .maybeSingle();
+  if (error) {
+    console.warn("Error leyendo alertas_whatsapp_config:", error.message);
+    return null;
+  }
+  return data || null;
+}
+
+// Numeros de 9 digitos (celular peruano) se completan con 51.
+function destinosAlertas(cfg) {
+  const out = [];
+  if (cfg?.grupo_id) out.push(String(cfg.grupo_id).trim());
+  for (const n of Array.isArray(cfg?.numeros) ? cfg.numeros : []) {
+    const d = String(n?.numero ?? n ?? "").replace(/\D/g, "");
+    if (d.length === 9) out.push(`51${d}`);
+    else if (d.length >= 10) out.push(d);
+  }
+  return [...new Set(out.filter(Boolean))];
+}
+
+async function enviarWhatsapp(destinos, texto) {
+  if (!EVOLUTION_APIKEY) return { enviados: 0, errores: ["Falta EVOLUTION_APIKEY en el servidor"] };
+  let enviados = 0;
+  const errores = [];
+  for (const number of destinos) {
+    try {
+      const res = await fetch(urlEvolution("/message/sendText"), {
+        method: "POST",
+        headers: { apikey: EVOLUTION_APIKEY, "Content-Type": "application/json" },
+        body: JSON.stringify({ number, text: texto }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${(await res.text()).slice(0, 160)}`);
+      enviados += 1;
+    } catch (e) {
+      errores.push(`${number}: ${e?.message}`);
+    }
+    // Pausa corta entre envios para no parecer spam ante WhatsApp.
+    await new Promise((r) => setTimeout(r, 1200));
+  }
+  if (errores.length) console.warn("Errores enviando WhatsApp:", errores.join(" | "));
+  return { enviados, errores };
+}
+
+const ultimaUrgentePorOrden = new Map();
+async function onChatUrgente(record = {}, orden = {}) {
+  const cfg = await leerConfigAlertas();
+  if (!cfg?.activo) return;
+  const destinos = destinosAlertas(cfg);
+  if (!destinos.length) return;
+  // Freno del lado del servidor (la app ya limita a 1 cada 10 min por orden).
+  const ahora = Date.now();
+  if (ahora - (ultimaUrgentePorOrden.get(record.orden_id) || 0) < 2 * 60 * 1000) return;
+  ultimaUrgentePorOrden.set(record.orden_id, ahora);
+
+  const hora = new Date(record.created_at || ahora).toLocaleTimeString("es-PE", {
+    hour: "2-digit", minute: "2-digit", timeZone: "America/Lima",
+  });
+  const lineas = [
+    `🚨 *URGENTE · ${orden.codigo || `Orden ${record.orden_id}`}*`,
+    "",
+    `👷 ${record.autor}${record.autor_rol ? ` (${record.autor_rol})` : ""}`,
+    orden.nombre ? `👤 Cliente: ${orden.nombre}${orden.nodo ? ` · ${orden.nodo}` : ""}` : null,
+    "",
+    record.texto ? `💬 "${record.texto}"` : null,
+    record.foto_url ? `📷 ${record.foto_url}` : null,
+    "",
+    `🕒 ${hora} · Responder en el chat de la orden (app o web)`,
+  ].filter((x) => x !== null);
+  await enviarWhatsapp(destinos, lineas.join("\n"));
+}
+
 function readJsonBody(req) {
   return new Promise((resolve, reject) => {
     let raw = "";
@@ -197,12 +287,16 @@ async function onChatOrdenMensaje(record = {}) {
 
   const { data: orden, error } = await supabase
     .from("ordenes")
-    .select("codigo,nombre,tecnico")
+    .select("*")
     .eq("id", ordenId)
     .maybeSingle();
   if (error || !orden) return;
 
-  const titulo = `Mensaje en orden${orden.codigo ? ` ${orden.codigo}` : ""}`;
+  if (record.urgente) {
+    onChatUrgente(record, orden).catch((e) => console.error("Error alerta urgente:", e?.message));
+  }
+
+  const titulo = `${record.urgente ? "🚨 URGENTE · " : ""}Mensaje en orden${orden.codigo ? ` ${orden.codigo}` : ""}`;
   const cuerpo = `${autor}: ${texto}`;
   const dataPayload = { tipo: "chat_orden", orden_id: String(ordenId) };
 
@@ -319,12 +413,63 @@ const routes = {
   },
 };
 
+// Endpoints para la pantalla "Alertas WhatsApp" de la web: estado de la
+// linea, lista de grupos (para elegir uno) y mensaje de prueba. No exponen
+// la API key; la prueba solo puede ir a los destinos ya guardados.
+let ultimaPrueba = 0;
+async function rutaAlertas(req, res) {
+  const responder = (status, obj) => {
+    res.writeHead(status, {
+      "content-type": "application/json",
+      "access-control-allow-origin": "*",
+      "access-control-allow-methods": "GET,POST,OPTIONS",
+      "access-control-allow-headers": "content-type",
+    });
+    res.end(JSON.stringify(obj));
+  };
+  if (req.method === "OPTIONS") return responder(204, {});
+  try {
+    if (req.method === "GET" && req.url === "/alertas/estado") {
+      if (!EVOLUTION_APIKEY) return responder(200, { ok: false, error: "Falta EVOLUTION_APIKEY en el servidor" });
+      const r = await fetch(urlEvolution("/instance/connectionState"), { headers: { apikey: EVOLUTION_APIKEY } });
+      const j = await r.json().catch(() => ({}));
+      return responder(200, { ok: r.ok, instancia: EVOLUTION_INSTANCIA, estado: j?.instance?.state || j?.state || "desconocido" });
+    }
+    if (req.method === "GET" && req.url === "/alertas/grupos") {
+      if (!EVOLUTION_APIKEY) return responder(200, { ok: false, error: "Falta EVOLUTION_APIKEY en el servidor" });
+      const r = await fetch(urlEvolution("/group/fetchAllGroups", "?getParticipants=false"), { headers: { apikey: EVOLUTION_APIKEY } });
+      const j = await r.json().catch(() => []);
+      if (!r.ok) return responder(200, { ok: false, error: `Evolution respondio ${r.status}` });
+      const grupos = (Array.isArray(j) ? j : [])
+        .map((g) => ({ id: g.id, nombre: String(g.subject || "").trim() || g.id, miembros: g.size || null }))
+        .sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
+      return responder(200, { ok: true, grupos });
+    }
+    if (req.method === "POST" && req.url === "/alertas/prueba") {
+      if (Date.now() - ultimaPrueba < 30 * 1000) return responder(200, { ok: false, error: "Espera 30 segundos entre pruebas." });
+      ultimaPrueba = Date.now();
+      const cfg = await leerConfigAlertas();
+      const destinos = destinosAlertas(cfg);
+      if (!destinos.length) return responder(200, { ok: false, error: "No hay grupo ni números guardados." });
+      const r = await enviarWhatsapp(destinos, "✅ *Prueba de alertas DIM*\n\nAsí llegarán los mensajes 🚨 URGENTE que manden los técnicos desde el chat de la orden.");
+      return responder(200, { ok: r.enviados > 0, enviados: r.enviados, total: destinos.length, errores: r.errores });
+    }
+    return responder(404, { ok: false, error: "not found" });
+  } catch (e) {
+    return responder(200, { ok: false, error: e?.message || "Error" });
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
     if (req.method === "GET" && req.url === "/health") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+    if (String(req.url || "").startsWith("/alertas/")) {
+      await rutaAlertas(req, res);
       return;
     }
     if (req.method !== "POST" || !routes[req.url]) {
