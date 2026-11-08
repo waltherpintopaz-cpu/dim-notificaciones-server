@@ -116,8 +116,21 @@ function urlEvolution(ruta, query = "") {
   return `${EVOLUTION_URL}${ruta}/${encodeURIComponent(EVOLUTION_INSTANCIA)}${query}`;
 }
 
-async function leerConfigAlertas() {
-  const { data, error } = await supabase
+// Americanet usa el mismo mecanismo de alertas (misma linea de WhatsApp),
+// pero con su propio Supabase: su config vive en SU alertas_whatsapp_config
+// y su trigger llama a /webhook/chat-ordenes-americanet solo con los
+// mensajes urgentes. La anon key es publica (va igual en la web).
+const AMERICANET_SUPABASE_URL = String(process.env.AMERICANET_SUPABASE_URL || "https://vgwbqbzpjlbkmxtfghdm.supabase.co").trim();
+const AMERICANET_SUPABASE_ANON_KEY = String(process.env.AMERICANET_SUPABASE_ANON_KEY || "sb_publishable_sC_66p4UKHUudDVyWyNcyA_bkrl_J2_").trim();
+const sbAmericanet = createClient(AMERICANET_SUPABASE_URL, AMERICANET_SUPABASE_ANON_KEY, { realtime: { transport: ws } });
+const EMPRESAS = {
+  dim: { sb: supabase, nombre: "DIM" },
+  americanet: { sb: sbAmericanet, nombre: "Americanet" },
+};
+const empresaDe = (clave) => EMPRESAS[String(clave || "").toLowerCase()] ? String(clave).toLowerCase() : "dim";
+
+async function leerConfigAlertas(sb = supabase) {
+  const { data, error } = await sb
     .from("alertas_whatsapp_config")
     .select("activo,grupo_id,grupo_nombre,numeros")
     .eq("id", 1)
@@ -165,21 +178,23 @@ async function enviarWhatsapp(destinos, texto) {
 }
 
 const ultimaUrgentePorOrden = new Map();
-async function onChatUrgente(record = {}, orden = {}) {
-  const cfg = await leerConfigAlertas();
+async function onChatUrgente(record = {}, orden = {}, empresa = "dim") {
+  const emp = EMPRESAS[empresa] || EMPRESAS.dim;
+  const cfg = await leerConfigAlertas(emp.sb);
   if (!cfg?.activo) return;
   const destinos = destinosAlertas(cfg);
   if (!destinos.length) return;
   // Freno del lado del servidor (la app ya limita a 1 cada 10 min por orden).
   const ahora = Date.now();
-  if (ahora - (ultimaUrgentePorOrden.get(record.orden_id) || 0) < 2 * 60 * 1000) return;
-  ultimaUrgentePorOrden.set(record.orden_id, ahora);
+  const clave = `${empresa}:${record.orden_id}`;
+  if (ahora - (ultimaUrgentePorOrden.get(clave) || 0) < 2 * 60 * 1000) return;
+  ultimaUrgentePorOrden.set(clave, ahora);
 
   const hora = new Date(record.created_at || ahora).toLocaleTimeString("es-PE", {
     hour: "2-digit", minute: "2-digit", timeZone: "America/Lima",
   });
   const lineas = [
-    `🚨 *URGENTE · ${orden.codigo || `Orden ${record.orden_id}`}*`,
+    `🚨 *URGENTE ${emp.nombre} · ${orden.codigo || `Orden ${record.orden_id}`}*`,
     "",
     `👷 ${record.autor}${record.autor_rol ? ` (${record.autor_rol})` : ""}`,
     orden.nombre ? `👤 Cliente: ${orden.nombre}${orden.nodo ? ` · ${orden.nodo}` : ""}` : null,
@@ -411,13 +426,24 @@ const routes = {
     if (payload.type !== "INSERT") return;
     await onTareaInsert(payload.record || {});
   },
+  // Americanet: su trigger solo manda los mensajes urgentes del chat (el
+  // push de Americanet va por otro lado); aqui solo se manda el WhatsApp.
+  "/webhook/chat-ordenes-americanet": async (payload) => {
+    const record = payload.record || {};
+    if (payload.type !== "INSERT" || !record.urgente || !record.orden_id) return;
+    const { data: orden } = await sbAmericanet.from("ordenes").select("*").eq("id", record.orden_id).maybeSingle();
+    await onChatUrgente(record, orden || {}, "americanet");
+  },
 };
 
 // Endpoints para la pantalla "Alertas WhatsApp" de la web: estado de la
 // linea, lista de grupos (para elegir uno) y mensaje de prueba. No exponen
 // la API key; la prueba solo puede ir a los destinos ya guardados.
-let ultimaPrueba = 0;
+const ultimaPrueba = {};
 async function rutaAlertas(req, res) {
+  const u = new URL(req.url, "http://local");
+  const ruta = u.pathname;
+  const empresa = empresaDe(u.searchParams.get("empresa"));
   const responder = (status, obj) => {
     res.writeHead(status, {
       "content-type": "application/json",
@@ -429,13 +455,13 @@ async function rutaAlertas(req, res) {
   };
   if (req.method === "OPTIONS") return responder(204, {});
   try {
-    if (req.method === "GET" && req.url === "/alertas/estado") {
+    if (req.method === "GET" && ruta === "/alertas/estado") {
       if (!EVOLUTION_APIKEY) return responder(200, { ok: false, error: "Falta EVOLUTION_APIKEY en el servidor" });
       const r = await fetch(urlEvolution("/instance/connectionState"), { headers: { apikey: EVOLUTION_APIKEY } });
       const j = await r.json().catch(() => ({}));
       return responder(200, { ok: r.ok, instancia: EVOLUTION_INSTANCIA, estado: j?.instance?.state || j?.state || "desconocido" });
     }
-    if (req.method === "GET" && req.url === "/alertas/grupos") {
+    if (req.method === "GET" && ruta === "/alertas/grupos") {
       if (!EVOLUTION_APIKEY) return responder(200, { ok: false, error: "Falta EVOLUTION_APIKEY en el servidor" });
       const r = await fetch(urlEvolution("/group/fetchAllGroups", "?getParticipants=false"), { headers: { apikey: EVOLUTION_APIKEY } });
       const j = await r.json().catch(() => []);
@@ -445,13 +471,13 @@ async function rutaAlertas(req, res) {
         .sort((a, b) => a.nombre.localeCompare(b.nombre, "es"));
       return responder(200, { ok: true, grupos });
     }
-    if (req.method === "POST" && req.url === "/alertas/prueba") {
-      if (Date.now() - ultimaPrueba < 30 * 1000) return responder(200, { ok: false, error: "Espera 30 segundos entre pruebas." });
-      ultimaPrueba = Date.now();
-      const cfg = await leerConfigAlertas();
+    if (req.method === "POST" && ruta === "/alertas/prueba") {
+      if (Date.now() - (ultimaPrueba[empresa] || 0) < 30 * 1000) return responder(200, { ok: false, error: "Espera 30 segundos entre pruebas." });
+      ultimaPrueba[empresa] = Date.now();
+      const cfg = await leerConfigAlertas(EMPRESAS[empresa].sb);
       const destinos = destinosAlertas(cfg);
       if (!destinos.length) return responder(200, { ok: false, error: "No hay grupo ni números guardados." });
-      const r = await enviarWhatsapp(destinos, "✅ *Prueba de alertas DIM*\n\nAsí llegarán los mensajes 🚨 URGENTE que manden los técnicos desde el chat de la orden.");
+      const r = await enviarWhatsapp(destinos, `✅ *Prueba de alertas ${EMPRESAS[empresa].nombre}*\n\nAsí llegarán los mensajes 🚨 URGENTE que manden los técnicos desde el chat de la orden.`);
       return responder(200, { ok: r.enviados > 0, enviados: r.enviados, total: destinos.length, errores: r.errores });
     }
     return responder(404, { ok: false, error: "not found" });
