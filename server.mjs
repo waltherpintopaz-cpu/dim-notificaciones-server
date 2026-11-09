@@ -231,34 +231,111 @@ async function enviarWhatsapp(destinos, texto) {
   return { enviados, errores };
 }
 
-const ultimaUrgentePorOrden = new Map();
-async function onChatUrgente(record = {}, orden = {}, empresa = "dim") {
+// Celular de un usuario (por nombre) en la base de la empresa -> "51XXXXXXXXX".
+async function celularDeUsuario(sb, nombre) {
+  const target = norm(nombre);
+  if (!target) return null;
+  const { data, error } = await sb.from("usuarios").select("nombre,username,celular,activo");
+  if (error) {
+    console.warn("Error leyendo celular de usuarios:", error.message);
+    return null;
+  }
+  const u = (data || []).find((x) => x.activo !== false && (norm(x.nombre) === target || norm(x.username) === target))
+    || (data || []).find((x) => x.activo !== false && norm(x.nombre) && (target.includes(norm(x.nombre)) || norm(x.nombre).includes(target)));
+  const d = String(u?.celular || "").replace(/\D/g, "");
+  if (d.length === 9) return `51${d}`;
+  return d.length >= 10 ? d : null;
+}
+
+// Alerta 🚨 URGENTE por WhatsApp, en las dos direcciones y en los dos chats:
+//   - escribe el TECNICO  -> grupo + numeros de la oficina (alertas_whatsapp_config,
+//                            con reglas de nodo privado si es chat de orden)
+//   - escribe la OFICINA  -> celular del tecnico (usuarios.celular), si
+//                            aviso_tecnico_whatsapp no esta apagado
+// ctx: { orden } para el chat de la orden, { hiloTecnico } para el chat con oficina.
+const ultimaUrgente = new Map();
+const urgentesProcesados = new Set();
+async function onChatUrgente(record = {}, ctx = {}, empresa = "dim") {
   const emp = EMPRESAS[empresa] || EMPRESAS.dim;
+  const orden = ctx.orden || {};
+  const hilo = ctx.hiloTecnico || "";
+  // Un mismo mensaje puede llegar por dos caminos (trigger viejo + nuevo).
+  const idMsg = `${empresa}:${hilo ? "hilo" : "orden"}:${record.id}`;
+  if (record.id != null) {
+    if (urgentesProcesados.has(idMsg)) return;
+    urgentesProcesados.add(idMsg);
+    if (urgentesProcesados.size > 5000) urgentesProcesados.clear();
+  }
   const cfg = await leerConfigAlertas(emp.sb);
   if (!cfg?.activo) return;
-  const destinos = destinosAlertas(cfg, orden.nodo);
+  const esTec = norm(record.autor_rol) === "tecnico";
+
+  let destinos = [];
+  if (esTec) {
+    destinos = destinosAlertas(cfg, hilo ? null : orden.nodo);
+  } else {
+    if (cfg.aviso_tecnico_whatsapp === false) return;
+    const tecnico = hilo || orden.tecnico || "";
+    if (!tecnico || norm(tecnico) === norm(record.autor)) return;
+    const cel = await celularDeUsuario(emp.sb, tecnico);
+    if (!cel) {
+      console.warn(`Urgente para ${tecnico} (${emp.nombre}): no tiene celular registrado.`);
+      return;
+    }
+    destinos = [cel];
+  }
   if (!destinos.length) return;
-  // Freno del lado del servidor (la app ya limita a 1 cada 10 min por orden).
+
+  // Freno del lado del servidor (la app ya limita a 1 cada 10 min).
   const ahora = Date.now();
-  const clave = `${empresa}:${record.orden_id}`;
-  if (ahora - (ultimaUrgentePorOrden.get(clave) || 0) < 2 * 60 * 1000) return;
-  ultimaUrgentePorOrden.set(clave, ahora);
+  const clave = `${empresa}:${hilo ? `hilo:${norm(hilo)}` : `orden:${record.orden_id}`}:${esTec ? "tec" : "ofi"}:${norm(record.autor)}`;
+  if (ahora - (ultimaUrgente.get(clave) || 0) < 2 * 60 * 1000) return;
+  ultimaUrgente.set(clave, ahora);
 
   const hora = new Date(record.created_at || ahora).toLocaleTimeString("es-PE", {
     hour: "2-digit", minute: "2-digit", timeZone: "America/Lima",
   });
+  const titulo = hilo
+    ? `🚨 *URGENTE ${emp.nombre} · Chat con oficina*`
+    : `🚨 *URGENTE ${emp.nombre} · ${orden.codigo || `Orden ${record.orden_id}`}*`;
   const lineas = [
-    `🚨 *URGENTE ${emp.nombre} · ${orden.codigo || `Orden ${record.orden_id}`}*`,
+    titulo,
     "",
-    `👷 ${record.autor}${record.autor_rol ? ` (${record.autor_rol})` : ""}`,
-    orden.nombre ? `👤 Cliente: ${orden.nombre}${orden.nodo ? ` · ${orden.nodo}` : ""}` : null,
+    `${esTec ? "👷" : "🏢"} ${record.autor}${record.autor_rol ? ` (${record.autor_rol})` : ""}`,
+    !hilo && orden.nombre ? `👤 Cliente: ${orden.nombre}${orden.nodo ? ` · ${orden.nodo}` : ""}` : null,
+    !hilo && !esTec && orden.direccion ? `📍 ${orden.direccion}` : null,
     "",
     record.texto ? `💬 "${record.texto}"` : null,
     record.foto_url ? `📷 ${record.foto_url}` : null,
     "",
-    `🕒 ${hora} · Responder en el chat de la orden (app o web)`,
+    esTec
+      ? `🕒 ${hora} · Responder en el chat ${hilo ? `con ${record.autor}` : "de la orden"} (app o web)`
+      : `🕒 ${hora} · Responde en la app, en el chat ${hilo ? "con oficina" : "de la orden"}`,
   ].filter((x) => x !== null);
   await enviarWhatsapp(destinos, lineas.join("\n"));
+}
+
+// Push "fuerte" para los urgentes: canal "urgente" de la APK (importancia
+// maxima, sonido de alarma, vibracion larga). Se apaga con
+// alertas_whatsapp_config.push_fuerte = false (vuelve al canal del chat).
+const ANDROID_URGENTE = { channelId: "urgente", icon: "notif_chat_campana", color: "#DC2626" };
+async function androidParaMensaje(record, opc) {
+  if (!record.urgente) return opc?.android || null;
+  const cfg = await leerConfigAlertas(supabase);
+  if (cfg && cfg.push_fuerte === false) return opc?.android || null;
+  return ANDROID_URGENTE;
+}
+
+// Americanet: avisos que llegan SIN secreto (su trigger nuevo no lo tiene).
+// No se confia en el payload: se relee el mensaje en la base de Americanet y
+// solo se actua si existe, es urgente, es reciente y no se proceso antes --
+// asi nadie puede usar esta ruta para mandar WhatsApp con texto inventado.
+async function urgenteAmericanetVerificado(tabla, id) {
+  if (id == null) return null;
+  const { data: msg, error } = await sbAmericanet.from(tabla).select("*").eq("id", id).maybeSingle();
+  if (error || !msg || !msg.urgente) return null;
+  if (Date.now() - new Date(msg.created_at || 0).getTime() > 10 * 60 * 1000) return null;
+  return msg;
 }
 
 function readJsonBody(req) {
@@ -362,20 +439,24 @@ async function onChatOrdenMensaje(record = {}) {
   if (error || !orden) return;
 
   if (record.urgente) {
-    onChatUrgente(record, orden).catch((e) => console.error("Error alerta urgente:", e?.message));
+    onChatUrgente(record, { orden }).catch((e) => console.error("Error alerta urgente:", e?.message));
   }
 
-  const opc = await opcionesChat();
+  // Los urgentes se avisan aunque los avisos de chat esten apagados.
+  const opc = (await opcionesChat()) || (record.urgente ? { titulo: (t) => t, android: null } : null);
   if (!opc) return;
-  const titulo = opc.titulo(`${record.urgente ? "🚨 URGENTE · " : ""}Orden${orden.codigo ? ` ${orden.codigo}` : ""}`);
+  const android = await androidParaMensaje(record, opc);
+  const titulo = record.urgente
+    ? `🚨 URGENTE · Orden${orden.codigo ? ` ${orden.codigo}` : ""}`
+    : opc.titulo(`Orden${orden.codigo ? ` ${orden.codigo}` : ""}`);
   const cuerpo = `${autor}: ${texto}`;
-  const dataPayload = { tipo: "chat_orden", orden_id: String(ordenId) };
+  const dataPayload = { tipo: "chat_orden", orden_id: String(ordenId), urgente: record.urgente ? "1" : "" };
 
   if (autorRol === norm("Tecnico")) {
     // Tecnico escribio -> avisar a todos los admins activos.
     const adminIds = await userIdsPorRol("Administrador");
     const adminTokens = await tokensPorUserIds(adminIds);
-    await enviarPush(adminTokens, { title: titulo, body: cuerpo, data: dataPayload, android: opc.android });
+    await enviarPush(adminTokens, { title: titulo, body: cuerpo, data: dataPayload, android });
   } else {
     // Gestora o admin escribio -> avisar al tecnico asignado a esa orden,
     // y ademas a todos los admins (pedido explicito: si escribe una
@@ -392,7 +473,7 @@ async function onChatOrdenMensaje(record = {}) {
       if (id !== autorId) destinatarioIds.add(id);
     }
     const tokens = await tokensPorUserIds([...destinatarioIds]);
-    await enviarPush(tokens, { title: titulo, body: cuerpo, data: dataPayload, android: opc.android });
+    await enviarPush(tokens, { title: titulo, body: cuerpo, data: dataPayload, android });
   }
 }
 
@@ -403,23 +484,28 @@ async function onChatTecnicoMensaje(record = {}) {
   const texto = record.texto || (record.foto_url ? "Foto" : "");
   if (!tecnicoNombre || !autor) return;
 
-  const opc = await opcionesChat();
+  if (record.urgente) {
+    onChatUrgente(record, { hiloTecnico: tecnicoNombre }).catch((e) => console.error("Error alerta urgente (hilo):", e?.message));
+  }
+
+  const opc = (await opcionesChat()) || (record.urgente ? { titulo: (t) => t, android: null } : null);
   if (!opc) return;
-  const titulo = opc.titulo(autor);
+  const android = await androidParaMensaje(record, opc);
+  const titulo = record.urgente ? `🚨 URGENTE · ${autor}` : opc.titulo(autor);
   const cuerpo = texto;
-  const dataPayload = { tipo: "chat_tecnico", tecnico_nombre: tecnicoNombre };
+  const dataPayload = { tipo: "chat_tecnico", tecnico_nombre: tecnicoNombre, urgente: record.urgente ? "1" : "" };
 
   if (autorRol === norm("Tecnico")) {
     // Tecnico escribio -> avisar a todas las gestoras + admins.
     const gestoraIds = await userIdsPorRol("Gestora");
     const adminIds = await userIdsPorRol("Administrador");
     const tokens = await tokensPorUserIds([...gestoraIds, ...adminIds]);
-    await enviarPush(tokens, { title: titulo, body: cuerpo, data: dataPayload, android: opc.android });
+    await enviarPush(tokens, { title: titulo, body: cuerpo, data: dataPayload, android });
   } else {
     // Gestora o admin escribio -> avisar solo al tecnico del hilo.
     const tecId = await userIdPorNombre(tecnicoNombre);
     const tecTokens = await tokensPorUserIds(tecId ? [tecId] : []);
-    await enviarPush(tecTokens, { title: titulo, body: cuerpo, data: dataPayload, android: opc.android });
+    await enviarPush(tecTokens, { title: titulo, body: cuerpo, data: dataPayload, android });
   }
 }
 
@@ -490,7 +576,23 @@ const routes = {
     const record = payload.record || {};
     if (payload.type !== "INSERT" || !record.urgente || !record.orden_id) return;
     const { data: orden } = await sbAmericanet.from("ordenes").select("*").eq("id", record.orden_id).maybeSingle();
-    await onChatUrgente(record, orden || {}, "americanet");
+    await onChatUrgente(record, { orden: orden || {} }, "americanet");
+  },
+};
+
+// Americanet, rutas SIN secreto (ver urgenteAmericanetVerificado): el trigger
+// solo manda { id } del mensaje urgente y aqui se relee de la base.
+const rutasAvisoAmericanet = {
+  "/aviso/chat-ordenes-americanet": async ({ id }) => {
+    const msg = await urgenteAmericanetVerificado("chat_ordenes_mensajes", id);
+    if (!msg?.orden_id) return;
+    const { data: orden } = await sbAmericanet.from("ordenes").select("*").eq("id", msg.orden_id).maybeSingle();
+    await onChatUrgente(msg, { orden: orden || {} }, "americanet");
+  },
+  "/aviso/chat-tecnicos-americanet": async ({ id }) => {
+    const msg = await urgenteAmericanetVerificado("chat_tecnicos_mensajes", id);
+    if (!msg?.tecnico_nombre) return;
+    await onChatUrgente(msg, { hiloTecnico: msg.tecnico_nombre }, "americanet");
   },
 };
 
@@ -539,6 +641,18 @@ async function rutaAlertas(req, res) {
       if (!destinos.length) return responder(200, { ok: false, error: "No hay grupo ni números guardados." });
       const r = await enviarWhatsapp(destinos, `✅ *Prueba de alertas ${EMPRESAS[empresa].nombre}${nodo ? ` · nodo ${nodo}` : ""}*\n\nAsí llegarán los mensajes 🚨 URGENTE que manden los técnicos desde el chat de la orden.`);
       return responder(200, { ok: r.enviados > 0, enviados: r.enviados, total: destinos.length, errores: r.errores });
+    }
+    // Prueba al celular de UN tecnico (el guardado en usuarios.celular).
+    if (req.method === "POST" && ruta === "/alertas/prueba-tecnico") {
+      const nombre = String(u.searchParams.get("nombre") || "").trim();
+      if (!nombre) return responder(200, { ok: false, error: "Falta el técnico." });
+      const k = `${empresa}:tec:${norm(nombre)}`;
+      if (Date.now() - (ultimaPrueba[k] || 0) < 30 * 1000) return responder(200, { ok: false, error: "Espera 30 segundos entre pruebas." });
+      ultimaPrueba[k] = Date.now();
+      const cel = await celularDeUsuario(EMPRESAS[empresa].sb, nombre);
+      if (!cel) return responder(200, { ok: false, error: `${nombre} no tiene celular guardado.` });
+      const r = await enviarWhatsapp([cel], `✅ *Prueba de alertas ${EMPRESAS[empresa].nombre}*\n\nHola ${nombre}, así te llegarán los mensajes 🚨 URGENTE que te mande la oficina desde el chat. Responde siempre desde la app.`);
+      return responder(200, { ok: r.enviados > 0, enviados: r.enviados, total: 1, errores: r.errores });
     }
     return responder(404, { ok: false, error: "not found" });
   } catch (e) {
@@ -598,6 +712,13 @@ const server = http.createServer(async (req, res) => {
     }
     if (String(req.url || "").startsWith("/alertas/")) {
       await rutaAlertas(req, res);
+      return;
+    }
+    if (req.method === "POST" && rutasAvisoAmericanet[req.url]) {
+      const body = await readJsonBody(req).catch(() => ({}));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+      rutasAvisoAmericanet[req.url](body || {}).catch((e) => console.error(`Error procesando ${req.url}:`, e?.message));
       return;
     }
     if (req.method !== "POST" || !routes[req.url]) {
