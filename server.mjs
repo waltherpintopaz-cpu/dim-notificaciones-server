@@ -44,8 +44,23 @@ const norm = (v = "") =>
     .toLowerCase()
     .replace(/[^a-z0-9]/g, "");
 
-async function tokensPorUserIds(userIds = []) {
-  const ids = [...new Set((userIds || []).filter((x) => x !== null && x !== undefined))];
+// Preferencias por usuario (usuarios.notif_prefs, jsonb): { ordenes,
+// liquidaciones, chat, tareas, materiales } -- false = ese usuario apago ese
+// tipo de aviso (lo elige cada uno en "Mis notificaciones" del panel/app).
+// Los urgentes (🚨) se mandan siempre. Si la columna no existe todavia, no se
+// filtra nada.
+async function filtrarPorPreferencia(ids, tipo) {
+  if (!tipo || !ids.length) return ids;
+  const { data, error } = await supabase.from("usuarios").select("id,notif_prefs").in("id", ids);
+  if (error) return ids;
+  const apagados = new Set((data || []).filter((u) => u?.notif_prefs && u.notif_prefs[tipo] === false).map((u) => u.id));
+  return ids.filter((id) => !apagados.has(id));
+}
+
+async function tokensPorUserIds(userIds = [], tipo = null) {
+  let ids = [...new Set((userIds || []).filter((x) => x !== null && x !== undefined))];
+  if (!ids.length) return [];
+  ids = await filtrarPorPreferencia(ids, tipo);
   if (!ids.length) return [];
   const { data, error } = await supabase.from("push_tokens").select("token,user_id").in("user_id", ids);
   if (error) {
@@ -55,14 +70,20 @@ async function tokensPorUserIds(userIds = []) {
   return (data || []).map((r) => r.token).filter(Boolean);
 }
 
+// rol puede ser un texto o una lista de roles.
 async function userIdsPorRol(rol) {
   const { data, error } = await supabase.from("usuarios").select("id,rol,activo").eq("activo", true);
   if (error) {
     console.warn("Error leyendo usuarios:", error.message);
     return [];
   }
-  return (data || []).filter((u) => norm(u.rol) === norm(rol)).map((u) => u.id);
+  const roles = new Set((Array.isArray(rol) ? rol : [rol]).map(norm));
+  return (data || []).filter((u) => roles.has(norm(u.rol))).map((u) => u.id);
 }
+
+// Quienes reciben "todo lo que recibe el admin": admins y socios (perfil
+// Socio de DIM, pedido 2026-11-10).
+const ROLES_SUPERVISION = ["Administrador", "Socio"];
 
 async function userIdPorNombre(nombre) {
   if (!nombre) return null;
@@ -371,8 +392,8 @@ async function onOrdenInsert(record = {}) {
   const tecnico = record.tecnico || "";
   const nodo = record.nodo || "";
 
-  const adminIds = await userIdsPorRol("Administrador");
-  const adminTokens = await tokensPorUserIds(adminIds);
+  const adminIds = await userIdsPorRol(ROLES_SUPERVISION);
+  const adminTokens = await tokensPorUserIds(adminIds, "ordenes");
   await enviarPush(adminTokens, {
     title: "Nueva orden creada",
     body: `${codigo} — ${cliente}${nodo ? ` (${nodo})` : ""}`,
@@ -381,7 +402,7 @@ async function onOrdenInsert(record = {}) {
 
   if (tecnico) {
     const tecId = await userIdPorNombre(tecnico);
-    const tecTokens = await tokensPorUserIds(tecId ? [tecId] : []);
+    const tecTokens = await tokensPorUserIds(tecId ? [tecId] : [], "ordenes");
     await enviarPush(tecTokens, {
       title: "Se te asignó una orden",
       body: `${codigo} — ${cliente}`,
@@ -395,8 +416,8 @@ async function onLiquidacionInsert(record = {}) {
   const tecnicoLiquida = record.tecnico_liquida || record.tecnico || "";
   const estado = record.estado || "";
 
-  const adminIds = await userIdsPorRol("Administrador");
-  const adminTokens = await tokensPorUserIds(adminIds);
+  const adminIds = await userIdsPorRol(ROLES_SUPERVISION);
+  const adminTokens = await tokensPorUserIds(adminIds, "liquidaciones");
   await enviarPush(adminTokens, {
     title: "Orden liquidada",
     body: `${codigo} liquidada por ${tecnicoLiquida}${estado ? ` (${estado})` : ""}`,
@@ -414,7 +435,7 @@ async function onLiquidacionInsert(record = {}) {
     const autor = !error ? orden?.autor_orden : null;
     if (autor) {
       const gestorId = await userIdPorNombre(autor);
-      const gestorTokens = await tokensPorUserIds(gestorId ? [gestorId] : []);
+      const gestorTokens = await tokensPorUserIds(gestorId ? [gestorId] : [], "liquidaciones");
       await enviarPush(gestorTokens, {
         title: "Tu orden fue liquidada",
         body: `${codigo} ya fue liquidada por ${tecnicoLiquida}`,
@@ -454,8 +475,8 @@ async function onChatOrdenMensaje(record = {}) {
 
   if (autorRol === norm("Tecnico")) {
     // Tecnico escribio -> avisar a todos los admins activos.
-    const adminIds = await userIdsPorRol("Administrador");
-    const adminTokens = await tokensPorUserIds(adminIds);
+    const adminIds = await userIdsPorRol(ROLES_SUPERVISION);
+    const adminTokens = await tokensPorUserIds(adminIds, record.urgente ? null : "chat");
     await enviarPush(adminTokens, { title: titulo, body: cuerpo, data: dataPayload, android });
   } else {
     // Gestora o admin escribio -> avisar al tecnico asignado a esa orden,
@@ -467,12 +488,12 @@ async function onChatOrdenMensaje(record = {}) {
       const tecId = await userIdPorNombre(orden.tecnico);
       if (tecId) destinatarioIds.add(tecId);
     }
-    const adminIds = await userIdsPorRol("Administrador");
+    const adminIds = await userIdsPorRol(ROLES_SUPERVISION);
     const autorId = await userIdPorNombre(autor);
     for (const id of adminIds) {
       if (id !== autorId) destinatarioIds.add(id);
     }
-    const tokens = await tokensPorUserIds([...destinatarioIds]);
+    const tokens = await tokensPorUserIds([...destinatarioIds], record.urgente ? null : "chat");
     await enviarPush(tokens, { title: titulo, body: cuerpo, data: dataPayload, android });
   }
 }
@@ -498,13 +519,13 @@ async function onChatTecnicoMensaje(record = {}) {
   if (autorRol === norm("Tecnico")) {
     // Tecnico escribio -> avisar a todas las gestoras + admins.
     const gestoraIds = await userIdsPorRol("Gestora");
-    const adminIds = await userIdsPorRol("Administrador");
-    const tokens = await tokensPorUserIds([...gestoraIds, ...adminIds]);
+    const adminIds = await userIdsPorRol(ROLES_SUPERVISION);
+    const tokens = await tokensPorUserIds([...gestoraIds, ...adminIds], record.urgente ? null : "chat");
     await enviarPush(tokens, { title: titulo, body: cuerpo, data: dataPayload, android });
   } else {
     // Gestora o admin escribio -> avisar solo al tecnico del hilo.
     const tecId = await userIdPorNombre(tecnicoNombre);
-    const tecTokens = await tokensPorUserIds(tecId ? [tecId] : []);
+    const tecTokens = await tokensPorUserIds(tecId ? [tecId] : [], record.urgente ? null : "chat");
     await enviarPush(tecTokens, { title: titulo, body: cuerpo, data: dataPayload, android });
   }
 }
@@ -518,7 +539,7 @@ async function onMaterialAsignado(record = {}, oldRecord = null) {
 
   if (!tecnico) return;
   const tecId = await userIdPorNombre(tecnico);
-  const tecTokens = await tokensPorUserIds(tecId ? [tecId] : []);
+  const tecTokens = await tokensPorUserIds(tecId ? [tecId] : [], "materiales");
   await enviarPush(tecTokens, {
     title: "Material asignado",
     body: `Se te asignó ${materialNombre}${cantidad ? ` (${cantidad})` : ""}`,
@@ -535,7 +556,7 @@ async function onTareaInsert(record = {}) {
   if (!asignadoA) return;
 
   const tecId = await userIdPorNombre(asignadoA);
-  const tokens = await tokensPorUserIds(tecId ? [tecId] : []);
+  const tokens = await tokensPorUserIds(tecId ? [tecId] : [], "tareas");
   await enviarPush(tokens, {
     title: `🔴 Tarea urgente${record.cliente_nombre ? ` · ${record.cliente_nombre}` : ""}`,
     body: `${record.asignado_por || "Alguien"}: ${record.descripcion || ""}`,
