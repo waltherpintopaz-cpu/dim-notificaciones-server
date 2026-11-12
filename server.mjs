@@ -136,6 +136,27 @@ async function userIdsPorRol(rol) {
   return (data || []).filter((u) => roles.has(norm(u.rol))).map((u) => u.id);
 }
 
+// Equipo del tecnico: el mismo y los usuarios activos con su mismo "grupo"
+// (usuarios.grupo, ej. Luis + Cristian). Asi los avisos del chat de una
+// orden les llegan a todos los que la ven en la app (pedido 2026-11-12).
+async function userIdsEquipo(nombreTecnico) {
+  const target = norm(nombreTecnico);
+  if (!target) return [];
+  let r = await supabase.from("usuarios").select("id,nombre,username,activo,grupo").eq("activo", true);
+  if (r.error) r = await supabase.from("usuarios").select("id,nombre,username,activo").eq("activo", true);
+  if (r.error) {
+    console.warn("Error leyendo usuarios (equipo):", r.error.message);
+    return [];
+  }
+  const lista = r.data || [];
+  const tec = lista.find((u) => norm(u.nombre) === target || norm(u.username) === target)
+    || lista.find((u) => { const n = norm(u.nombre); return n && (target.includes(n) || n.includes(target)); });
+  if (!tec) return [];
+  const grupo = String(tec.grupo || "").trim().toLowerCase();
+  if (!grupo) return [tec.id];
+  return lista.filter((u) => u.id === tec.id || String(u.grupo || "").trim().toLowerCase() === grupo).map((u) => u.id);
+}
+
 // Quienes reciben "todo lo que recibe el admin": admins y socios (perfil
 // Socio de DIM, pedido 2026-11-10).
 const ROLES_SUPERVISION = ["Administrador", "Socio"];
@@ -536,29 +557,19 @@ async function onChatOrdenMensaje(record = {}) {
     ts: tsMensaje(record),
   };
 
-  if (autorRol === norm("Tecnico")) {
-    // Tecnico escribio -> avisar a todos los admins activos.
-    const adminIds = await userIdsPorRol(ROLES_SUPERVISION);
-    const adminTokens = await tokensPorUserIds(adminIds, record.urgente ? null : "chat");
-    await enviarPushChat(adminTokens, { title: titulo, body: cuerpo, data: dataPayload, android, conv });
-  } else {
-    // Gestora o admin escribio -> avisar al tecnico asignado a esa orden,
-    // y ademas a todos los admins (pedido explicito: si escribe una
-    // gestora, el admin tambien se entera). No se duplica aviso al propio
-    // autor si el que escribe es admin.
-    const destinatarioIds = new Set();
-    if (orden.tecnico && norm(orden.tecnico) !== norm(autor)) {
-      const tecId = await userIdPorNombre(orden.tecnico);
-      if (tecId) destinatarioIds.add(tecId);
-    }
-    const adminIds = await userIdsPorRol(ROLES_SUPERVISION);
-    const autorId = await userIdPorNombre(autor);
-    for (const id of adminIds) {
-      if (id !== autorId) destinatarioIds.add(id);
-    }
-    const tokens = await tokensPorUserIds([...destinatarioIds], record.urgente ? null : "chat");
-    await enviarPushChat(tokens, { title: titulo, body: cuerpo, data: dataPayload, android, conv });
+  // A quien avisar: admins/socios + el equipo del tecnico asignado (el y
+  // los de su mismo grupo), menos el propio autor. Si escribe un tecnico
+  // del equipo, se enteran sus compañeros; si escribe la oficina, todo el
+  // equipo.
+  const autorId = await userIdPorNombre(autor);
+  const destinatarioIds = new Set();
+  if (orden.tecnico) {
+    for (const id of await userIdsEquipo(orden.tecnico)) destinatarioIds.add(id);
   }
+  for (const id of await userIdsPorRol(ROLES_SUPERVISION)) destinatarioIds.add(id);
+  if (autorId) destinatarioIds.delete(autorId);
+  const tokens = await tokensPorUserIds([...destinatarioIds], record.urgente ? null : "chat");
+  await enviarPushChat(tokens, { title: titulo, body: cuerpo, data: dataPayload, android, conv });
 }
 
 async function onChatTecnicoMensaje(record = {}) {
