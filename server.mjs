@@ -70,6 +70,61 @@ async function tokensPorUserIds(userIds = [], tipo = null) {
   return (data || []).map((r) => r.token).filter(Boolean);
 }
 
+// Tokens que dibujan el chat en estilo conversacion (APK con ChatNotif.kt,
+// registran token_type "fcm_conv"). A esos se les manda el chat como
+// mensaje SOLO de datos; al resto, el aviso clasico de siempre.
+async function tokensConversacion(tokens = []) {
+  const lista = [...new Set((tokens || []).filter(Boolean))];
+  if (!lista.length) return new Set();
+  const { data, error } = await supabase.from("push_tokens").select("token").in("token", lista).eq("token_type", "fcm_conv");
+  if (error) {
+    console.warn("Error leyendo token_type:", error.message);
+    return new Set();
+  }
+  return new Set((data || []).map((r) => r.token));
+}
+
+// Push de chat: estilo conversacion (una notificacion por chat, con
+// Responder) a las APK nuevas; aviso clasico a las viejas.
+async function enviarPushChat(tokens, { title, body, data = {}, android = null, conv }) {
+  const lista = [...new Set((tokens || []).filter(Boolean))];
+  if (!lista.length) return { enviados: 0 };
+  const nuevos = await tokensConversacion(lista);
+  const viejos = lista.filter((t) => !nuevos.has(t));
+  let enviados = 0;
+  if (viejos.length) enviados += (await enviarPush(viejos, { title, body, data, android })).enviados;
+  if (!nuevos.size) return { enviados };
+  const datos = Object.fromEntries(Object.entries({
+    ...data,
+    estilo: "conv",
+    title,
+    body,
+    chat_key: conv.chatKey,
+    chat_titulo: conv.titulo,
+    autor: conv.autor,
+    texto: conv.texto,
+    msg_id: conv.msgId,
+    ts: conv.ts,
+    canal: android?.channelId || "chat_burbuja",
+    icono: android?.icon || "",
+    color: android?.color || "",
+  }).map(([k, v]) => [k, String(v ?? "")]));
+  for (const token of nuevos) {
+    try {
+      await admin.messaging().send({ token, data: datos, android: { priority: "high" } });
+      enviados += 1;
+    } catch (e) {
+      console.warn("Fallo enviando push de chat (conv) a un token:", e?.errorInfo?.code || e?.message);
+    }
+  }
+  return { enviados };
+}
+
+const tsMensaje = (record) => {
+  const t = new Date(record?.created_at || Date.now()).getTime();
+  return String(Number.isFinite(t) ? t : Date.now());
+};
+
 // rol puede ser un texto o una lista de roles.
 async function userIdsPorRol(rol) {
   const { data, error } = await supabase.from("usuarios").select("id,rol,activo").eq("activo", true);
@@ -472,12 +527,20 @@ async function onChatOrdenMensaje(record = {}) {
     : opc.titulo(`Orden${orden.codigo ? ` ${orden.codigo}` : ""}`);
   const cuerpo = `${autor}: ${texto}`;
   const dataPayload = { tipo: "chat_orden", orden_id: String(ordenId), urgente: record.urgente ? "1" : "" };
+  const conv = {
+    chatKey: `orden:${ordenId}`,
+    titulo: [orden.codigo || "Orden", orden.nombre].filter(Boolean).join(" · "),
+    autor,
+    texto: record.texto || (record.foto_url ? "📷 Foto" : ""),
+    msgId: record.id,
+    ts: tsMensaje(record),
+  };
 
   if (autorRol === norm("Tecnico")) {
     // Tecnico escribio -> avisar a todos los admins activos.
     const adminIds = await userIdsPorRol(ROLES_SUPERVISION);
     const adminTokens = await tokensPorUserIds(adminIds, record.urgente ? null : "chat");
-    await enviarPush(adminTokens, { title: titulo, body: cuerpo, data: dataPayload, android });
+    await enviarPushChat(adminTokens, { title: titulo, body: cuerpo, data: dataPayload, android, conv });
   } else {
     // Gestora o admin escribio -> avisar al tecnico asignado a esa orden,
     // y ademas a todos los admins (pedido explicito: si escribe una
@@ -494,7 +557,7 @@ async function onChatOrdenMensaje(record = {}) {
       if (id !== autorId) destinatarioIds.add(id);
     }
     const tokens = await tokensPorUserIds([...destinatarioIds], record.urgente ? null : "chat");
-    await enviarPush(tokens, { title: titulo, body: cuerpo, data: dataPayload, android });
+    await enviarPushChat(tokens, { title: titulo, body: cuerpo, data: dataPayload, android, conv });
   }
 }
 
@@ -515,18 +578,25 @@ async function onChatTecnicoMensaje(record = {}) {
   const titulo = record.urgente ? `🚨 URGENTE · ${autor}` : opc.titulo(autor);
   const cuerpo = texto;
   const dataPayload = { tipo: "chat_tecnico", tecnico_nombre: tecnicoNombre, urgente: record.urgente ? "1" : "" };
+  const convBase = {
+    chatKey: `tecnico:${String(tecnicoNombre).trim()}`,
+    autor,
+    texto: record.texto || (record.foto_url ? "📷 Foto" : ""),
+    msgId: record.id,
+    ts: tsMensaje(record),
+  };
 
   if (autorRol === norm("Tecnico")) {
     // Tecnico escribio -> avisar a todas las gestoras + admins.
     const gestoraIds = await userIdsPorRol("Gestora");
     const adminIds = await userIdsPorRol(ROLES_SUPERVISION);
     const tokens = await tokensPorUserIds([...gestoraIds, ...adminIds], record.urgente ? null : "chat");
-    await enviarPush(tokens, { title: titulo, body: cuerpo, data: dataPayload, android });
+    await enviarPushChat(tokens, { title: titulo, body: cuerpo, data: dataPayload, android, conv: { ...convBase, titulo: `👷 ${tecnicoNombre}` } });
   } else {
     // Gestora o admin escribio -> avisar solo al tecnico del hilo.
     const tecId = await userIdPorNombre(tecnicoNombre);
     const tecTokens = await tokensPorUserIds(tecId ? [tecId] : [], record.urgente ? null : "chat");
-    await enviarPush(tecTokens, { title: titulo, body: cuerpo, data: dataPayload, android });
+    await enviarPushChat(tecTokens, { title: titulo, body: cuerpo, data: dataPayload, android, conv: { ...convBase, titulo: "🏢 Oficina" } });
   }
 }
 
