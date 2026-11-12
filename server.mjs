@@ -766,6 +766,75 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+// ── Aviso "orden en proceso hace 3 h" (regla una orden a la vez, 2026-11-11) ──
+// Solo para tecnicos con usuarios.regla_una_orden = true. Usa ordenes.iniciada_en
+// (la pone un trigger al pasar a "En Proceso") y ordenes.aviso_proceso_en para
+// no repetir antes de 2 h. Solo de 7:00 a 21:00 (hora Lima). Si las columnas
+// no existen todavia (SQL sin correr), no hace nada.
+const AVISO_PROCESO_HORAS = Number(process.env.AVISO_PROCESO_HORAS || 3) || 3;
+const AVISO_PROCESO_REPETIR_HORAS = 2;
+
+async function pushAmericanetATecnico(nombre, { title, body, data }) {
+  const r = await fetch(`${AMERICANET_SUPABASE_URL}/functions/v1/send-push-notification`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: AMERICANET_SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${AMERICANET_SUPABASE_ANON_KEY}`,
+    },
+    body: JSON.stringify({ tecnico_nombre: nombre, title, body, data }),
+  });
+  return r.ok;
+}
+
+async function revisarOrdenesEnProceso(empresa) {
+  const emp = EMPRESAS[empresa];
+  const horaLima = Number(new Date().toLocaleString("en-US", { hour: "numeric", hour12: false, timeZone: "America/Lima" }));
+  if (horaLima < 7 || horaLima >= 21) return;
+  const limite = new Date(Date.now() - AVISO_PROCESO_HORAS * 3600e3).toISOString();
+  const repetir = new Date(Date.now() - AVISO_PROCESO_REPETIR_HORAS * 3600e3).toISOString();
+  const { data: ordenes, error } = await emp.sb
+    .from("ordenes")
+    .select("id,codigo,nombre,tecnico,iniciada_en,aviso_proceso_en")
+    .not("iniciada_en", "is", null)
+    .lt("iniciada_en", limite)
+    .ilike("estado", "%proceso%")
+    .or(`aviso_proceso_en.is.null,aviso_proceso_en.lt.${repetir}`)
+    .limit(200);
+  if (error || !ordenes?.length) return;
+  const { data: usuarios, error: eu } = await emp.sb.from("usuarios").select("id,nombre,regla_una_orden").eq("regla_una_orden", true);
+  if (eu || !usuarios?.length) return;
+  const conRegla = new Map(usuarios.map((u) => [norm(u.nombre), u]));
+  for (const o of ordenes) {
+    const u = conRegla.get(norm(o.tecnico));
+    if (!u) continue;
+    const hora = new Date(o.iniciada_en).toLocaleTimeString("es-PE", { hour: "2-digit", minute: "2-digit", timeZone: "America/Lima" });
+    const title = "⏰ Orden sin liquidar";
+    const body = `Tienes ${o.codigo || "una orden"}${o.nombre ? ` (${o.nombre})` : ""} en proceso desde las ${hora}. Liquídala o libérala.`;
+    const data = { tipo: "orden_en_proceso", orden_id: o.id, codigo: o.codigo || "" };
+    try {
+      if (empresa === "dim") {
+        const tokens = await tokensPorUserIds([u.id]);
+        await enviarPush(tokens, { title, body, data });
+      } else {
+        await pushAmericanetATecnico(u.nombre, { title, body, data });
+      }
+      console.log(`Aviso en proceso ${emp.nombre}: ${o.codigo} -> ${u.nombre}`);
+    } catch (e) {
+      console.warn(`Aviso en proceso ${emp.nombre} ${o.codigo}:`, e?.message);
+    }
+    await emp.sb.from("ordenes").update({ aviso_proceso_en: new Date().toISOString() }).eq("id", o.id);
+  }
+}
+
+function revisarTodasOrdenesEnProceso() {
+  for (const empresa of Object.keys(EMPRESAS)) {
+    revisarOrdenesEnProceso(empresa).catch((e) => console.warn(`revisarOrdenesEnProceso ${empresa}:`, e?.message));
+  }
+}
+setTimeout(revisarTodasOrdenesEnProceso, 30 * 1000);
+setInterval(revisarTodasOrdenesEnProceso, 10 * 60 * 1000);
+
 server.listen(PORT, HOST, () => {
   console.log(`Servidor de notificaciones DIM escuchando en http://${HOST}:${PORT}`);
 });
