@@ -878,3 +878,31 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   console.log(`Servidor de notificaciones DIM escuchando en http://${HOST}:${PORT}`);
 });
+
+// ── Aviso diario 8:00 (hora Peru) a admin/socios/gestoras: ordenes "Por
+// coordinar" (sin fecha, el cliente iba a avisar) con 3 dias o mas. ──
+let ultimoAvisoPorCoordinar = "";
+async function revisarPorCoordinar() {
+  const lima = new Date(Date.now() - 5 * 3600000);
+  const dia = lima.toISOString().slice(0, 10);
+  if (lima.getUTCHours() !== 8 || ultimoAvisoPorCoordinar === dia) return;
+  ultimoAvisoPorCoordinar = dia;
+  const limite = new Date(Date.now() - 3 * 86400000).toISOString();
+  const { data, error } = await supabase.from("ordenes")
+    .select("codigo,nombre,por_coordinar_desde,estado")
+    .not("por_coordinar_desde", "is", null).lt("por_coordinar_desde", limite)
+    .ilike("estado", "%pendient%").order("por_coordinar_desde");
+  if (error) throw error;
+  const lista = data || [];
+  if (!lista.length) return;
+  const ids = new Set(await userIdsPorRol([...ROLES_SUPERVISION, "Gestora"]));
+  const tokens = await tokensPorUserIds([...ids], null);
+  const nombres = lista.slice(0, 6).map((o) => `${o.codigo || ""} ${String(o.nombre || "").trim().split(" ")[0]}`).join(", ");
+  await enviarPush(tokens, {
+    title: `⏸ ${lista.length} orden${lista.length === 1 ? "" : "es"} por coordinar sin respuesta`,
+    body: `Hace +3 días esperando al cliente: ${nombres}${lista.length > 6 ? "…" : ""}. Llámalos o ponles fecha.`,
+    data: { tipo: "por_coordinar", cantidad: String(lista.length) },
+  });
+  console.log(`Aviso por coordinar enviado (${lista.length} ordenes).`);
+}
+setInterval(() => { revisarPorCoordinar().catch((e) => console.error("Aviso por coordinar:", e?.message)); }, 10 * 60000);
