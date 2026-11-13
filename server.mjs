@@ -567,9 +567,22 @@ async function onChatOrdenMensaje(record = {}) {
     for (const id of await userIdsEquipo(orden.tecnico)) destinatarioIds.add(id);
   }
   for (const id of await userIdsPorRol(ROLES_SUPERVISION)) destinatarioIds.add(id);
+  // @menciones: el mencionado recibe aviso aparte, mas fuerte (como urgente),
+  // aunque no sea del equipo de la orden.
+  const mencionadoIds = new Set();
+  for (const n of Array.isArray(record.menciones) ? record.menciones : []) {
+    const id = await userIdPorNombre(n);
+    if (id && id !== autorId) { mencionadoIds.add(id); destinatarioIds.delete(id); }
+  }
   if (autorId) destinatarioIds.delete(autorId);
   const tokens = await tokensPorUserIds([...destinatarioIds], record.urgente ? null : "chat");
   await enviarPushChat(tokens, { title: titulo, body: cuerpo, data: dataPayload, android, conv });
+  if (mencionadoIds.size) {
+    const tokMen = await tokensPorUserIds([...mencionadoIds], null);
+    const androidMen = await androidParaMensaje({ ...record, urgente: true }, opc);
+    const quien = String(autor).trim().split(" ")[0] || "Alguien";
+    await enviarPushChat(tokMen, { title: `📣 ${quien} te mencionó · ${orden.codigo || "Orden"}`, body: cuerpo, data: dataPayload, android: androidMen, conv });
+  }
 }
 
 async function onChatTecnicoMensaje(record = {}) {
