@@ -363,6 +363,8 @@ async function onChatUrgente(record = {}, ctx = {}, empresa = "dim") {
     urgentesProcesados.add(idMsg);
     if (urgentesProcesados.size > 5000) urgentesProcesados.clear();
   }
+  // Urgente "solo alarma": suena en la app (push) pero NO va por WhatsApp.
+  if (record.urgente_whatsapp === false) return;
   const cfg = await leerConfigAlertas(emp.sb);
   if (!cfg?.activo) return;
   const esTec = norm(record.autor_rol) === "tecnico";
