@@ -561,12 +561,27 @@ async function onChatOrdenMensaje(record = {}) {
   // los de su mismo grupo), menos el propio autor. Si escribe un tecnico
   // del equipo, se enteran sus compañeros; si escribe la oficina, todo el
   // equipo.
+  // Reglas (13-nov): respuesta de un gestor copiada desde Chatwoot -> no
+  // suena a nadie (salvo @mencion); orden "Por coordinar" + mensaje del
+  // cliente -> solo oficina; chat silenciado por la persona -> no le suena.
+  const esDeChatwoot = autorRol === "chatwoot";
+  const soloOficina = !!orden.por_coordinar_desde && autorRol === "cliente";
   const autorId = await userIdPorNombre(autor);
   const destinatarioIds = new Set();
-  if (orden.tecnico) {
+  if (orden.tecnico && !esDeChatwoot && !soloOficina) {
     for (const id of await userIdsEquipo(orden.tecnico)) destinatarioIds.add(id);
   }
-  for (const id of await userIdsPorRol(ROLES_SUPERVISION)) destinatarioIds.add(id);
+  if (!esDeChatwoot) {
+    for (const id of await userIdsPorRol(ROLES_SUPERVISION)) destinatarioIds.add(id);
+  }
+  if (!record.urgente) {
+    const { data: silencios } = await supabase.from("chat_silencios").select("usuario")
+      .eq("clave", `orden:${ordenId}`).gt("hasta", new Date().toISOString());
+    for (const sil of silencios || []) {
+      const id = await userIdPorNombre(sil.usuario);
+      if (id) destinatarioIds.delete(id);
+    }
+  }
   // @menciones: el mencionado recibe aviso aparte, mas fuerte (como urgente),
   // aunque no sea del equipo de la orden.
   const mencionadoIds = new Set();
